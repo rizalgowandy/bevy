@@ -1,148 +1,141 @@
-use bevy_app::{PluginGroup, PluginGroupBuilder};
+use bevy_app::{plugin_group, Plugin};
 
-use bevy_app::ScheduleRunnerPlugin;
-use bevy_asset::AssetPlugin;
-#[cfg(feature = "bevy_audio")]
-use bevy_audio::AudioPlugin;
-use bevy_core::CorePlugin;
-use bevy_diagnostic::DiagnosticsPlugin;
-#[cfg(feature = "bevy_gilrs")]
-use bevy_gilrs::GilrsPlugin;
-#[cfg(feature = "bevy_gltf")]
-use bevy_gltf::GltfPlugin;
-use bevy_input::InputPlugin;
-use bevy_log::LogPlugin;
-#[cfg(feature = "bevy_pbr")]
-use bevy_pbr::PbrPlugin;
-#[cfg(feature = "bevy_render")]
-use bevy_render::RenderPlugin;
-use bevy_scene::ScenePlugin;
-#[cfg(feature = "bevy_sprite")]
-use bevy_sprite::SpritePlugin;
-#[cfg(feature = "bevy_text")]
-use bevy_text::TextPlugin;
-use bevy_transform::TransformPlugin;
-#[cfg(feature = "bevy_ui")]
-use bevy_ui::UiPlugin;
-#[cfg(feature = "bevy_wgpu")]
-use bevy_wgpu::WgpuPlugin;
-use bevy_window::WindowPlugin;
-#[cfg(feature = "bevy_winit")]
-use bevy_winit::WinitPlugin;
-
-/// This plugin group will add all the default plugins:
-/// * [`LogPlugin`]
-/// * [`CorePlugin`]
-/// * [`TransformPlugin`]
-/// * [`DiagnosticsPlugin`]
-/// * [`InputPlugin`]
-/// * [`WindowPlugin`]
-/// * [`AssetPlugin`]
-/// * [`ScenePlugin`]
-/// * [`RenderPlugin`] - with feature `bevy_render`
-/// * [`SpritePlugin`] - with feature `bevy_sprite`
-/// * [`PbrPlugin`] - with feature `bevy_pbr`
-/// * [`UiPlugin`] - with feature `bevy_ui`
-/// * [`TextPlugin`] - with feature `bevy_text`
-/// * [`AudioPlugin`] - with feature `bevy_audio`
-/// * [`GilrsPlugin`] - with feature `bevy_gilrs`
-/// * [`GltfPlugin`] - with feature `bevy_gltf`
-/// * [`WinitPlugin`] - with feature `bevy_winit`
-/// * [`WgpuPlugin`] - with feature `bevy_wgpu`
-///
-/// See also [`MinimalPlugins`] for a slimmed down option
-pub struct DefaultPlugins;
-
-impl PluginGroup for DefaultPlugins {
-    fn build(&mut self, group: &mut PluginGroupBuilder) {
-        group.add(LogPlugin::default());
-        group.add(CorePlugin::default());
-        group.add(TransformPlugin::default());
-        group.add(DiagnosticsPlugin::default());
-        group.add(InputPlugin::default());
-        group.add(WindowPlugin::default());
-        group.add(AssetPlugin::default());
-        group.add(ScenePlugin::default());
-
+plugin_group! {
+    /// This plugin group will add all the default plugins for a *Bevy* application:
+    pub struct DefaultPlugins {
+        bevy_app:::PanicHandlerPlugin,
+        bevy_log:::LogPlugin,
+        bevy_app:::TaskPoolPlugin,
+        bevy_diagnostic:::FrameCountPlugin,
+        bevy_time:::TimePlugin,
+        bevy_transform:::TransformPlugin,
+        bevy_diagnostic:::DiagnosticsPlugin,
+        bevy_input:::InputPlugin,
+        #[custom(cfg(not(feature = "bevy_window")))]
+        bevy_app:::ScheduleRunnerPlugin,
+        #[cfg(feature = "bevy_window")]
+        bevy_window:::WindowPlugin,
+        #[cfg(feature = "bevy_window")]
+        bevy_a11y:::AccessibilityPlugin,
+        #[custom(cfg(any(unix, windows)))]
+        bevy_app:::TerminalCtrlCHandlerPlugin,
+        #[cfg(feature = "bevy_asset")]
+        bevy_asset:::AssetPlugin,
+        #[cfg(feature = "bevy_scene")]
+        bevy_scene:::ScenePlugin,
+        #[cfg(feature = "bevy_winit")]
+        bevy_winit:::WinitPlugin,
         #[cfg(feature = "bevy_render")]
-        group.add(RenderPlugin::default());
-
-        #[cfg(feature = "bevy_sprite")]
-        group.add(SpritePlugin::default());
-
-        #[cfg(feature = "bevy_pbr")]
-        group.add(PbrPlugin::default());
-
-        #[cfg(feature = "bevy_ui")]
-        group.add(UiPlugin::default());
-
-        #[cfg(feature = "bevy_text")]
-        group.add(TextPlugin::default());
-
-        #[cfg(feature = "bevy_audio")]
-        group.add(AudioPlugin::default());
-
-        #[cfg(feature = "bevy_gilrs")]
-        group.add(GilrsPlugin::default());
-
-        #[cfg(feature = "bevy_gltf")]
-        group.add(GltfPlugin::default());
-
-        #[cfg(feature = "bevy_winit")]
-        group.add(WinitPlugin::default());
-
-        #[cfg(feature = "bevy_wgpu")]
-        group.add(WgpuPlugin::default());
-    }
-}
-
-/// Minimal plugin group that will add the following plugins:
-/// * [`CorePlugin`]
-/// * [`ScheduleRunnerPlugin`]
-///
-/// See also [`DefaultPlugins`] for a more complete set of plugins
-pub struct MinimalPlugins;
-
-impl PluginGroup for MinimalPlugins {
-    fn build(&mut self, group: &mut PluginGroupBuilder) {
-        group.add(CorePlugin::default());
-        group.add(ScheduleRunnerPlugin::default());
-    }
-}
-
-pub struct PipelinedDefaultPlugins;
-
-impl PluginGroup for PipelinedDefaultPlugins {
-    fn build(&mut self, group: &mut PluginGroupBuilder) {
-        group.add(bevy_log::LogPlugin::default());
-        group.add(bevy_core::CorePlugin::default());
-        group.add(bevy_transform::TransformPlugin::default());
-        group.add(bevy_diagnostic::DiagnosticsPlugin::default());
-        group.add(bevy_input::InputPlugin::default());
-        group.add(bevy_window::WindowPlugin::default());
-        group.add(bevy_asset::AssetPlugin::default());
-        group.add(bevy_scene::ScenePlugin::default());
-
-        #[cfg(feature = "bevy_winit")]
-        group.add(bevy_winit::WinitPlugin::default());
-
-        #[cfg(feature = "bevy_render2")]
-        {
-            group.add(bevy_render2::RenderPlugin::default());
-        }
-
+        bevy_render:::RenderPlugin,
+        // NOTE: Load this after renderer initialization so that it knows about the supported
+        // compressed texture formats.
+        #[cfg(feature = "bevy_render")]
+        bevy_render::texture:::ImagePlugin,
+        #[cfg(feature = "bevy_render")]
+        #[custom(cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded")))]
+        bevy_render::pipelined_rendering:::PipelinedRenderingPlugin,
         #[cfg(feature = "bevy_core_pipeline")]
+        bevy_core_pipeline:::CorePipelinePlugin,
+        #[cfg(feature = "bevy_sprite")]
+        bevy_sprite:::SpritePlugin,
+        #[cfg(feature = "bevy_text")]
+        bevy_text:::TextPlugin,
+        #[cfg(feature = "bevy_ui")]
+        bevy_ui:::UiPlugin,
+        #[cfg(feature = "bevy_pbr")]
+        bevy_pbr:::PbrPlugin,
+        // NOTE: Load this after renderer initialization so that it knows about the supported
+        // compressed texture formats.
+        #[cfg(feature = "bevy_gltf")]
+        bevy_gltf:::GltfPlugin,
+        #[cfg(feature = "bevy_audio")]
+        bevy_audio:::AudioPlugin,
+        #[cfg(feature = "bevy_gilrs")]
+        bevy_gilrs:::GilrsPlugin,
+        #[cfg(feature = "bevy_animation")]
+        bevy_animation:::AnimationPlugin,
+        #[cfg(feature = "bevy_gizmos")]
+        bevy_gizmos:::GizmoPlugin,
+        #[cfg(feature = "bevy_state")]
+        bevy_state::app:::StatesPlugin,
+        #[cfg(feature = "bevy_dev_tools")]
+        bevy_dev_tools:::DevToolsPlugin,
+        #[cfg(feature = "bevy_ci_testing")]
+        bevy_dev_tools::ci_testing:::CiTestingPlugin,
+        #[plugin_group]
+        #[cfg(feature = "bevy_picking")]
+        bevy_picking:::DefaultPickingPlugins,
+        #[doc(hidden)]
+        :IgnoreAmbiguitiesPlugin,
+    }
+    /// [`DefaultPlugins`] obeys *Cargo* *feature* flags. Users may exert control over this plugin group
+    /// by disabling `default-features` in their `Cargo.toml` and enabling only those features
+    /// that they wish to use.
+    ///
+    /// [`DefaultPlugins`] contains all the plugins typically required to build
+    /// a *Bevy* application which includes a *window* and presentation components.
+    /// For the absolute minimum number of plugins needed to run a Bevy application, see [`MinimalPlugins`].
+}
+
+#[derive(Default)]
+struct IgnoreAmbiguitiesPlugin;
+
+impl Plugin for IgnoreAmbiguitiesPlugin {
+    #[expect(
+        clippy::allow_attributes,
+        reason = "`unused_variables` is not always linted"
+    )]
+    #[allow(
+        unused_variables,
+        reason = "The `app` parameter is used only if a combination of crates that contain ambiguities with each other are enabled."
+    )]
+    fn build(&self, app: &mut bevy_app::App) {
+        // bevy_ui owns the Transform and cannot be animated
+        #[cfg(all(feature = "bevy_animation", feature = "bevy_ui"))]
+        if app.is_plugin_added::<bevy_animation::AnimationPlugin>()
+            && app.is_plugin_added::<bevy_ui::UiPlugin>()
         {
-            group.add(bevy_core_pipeline::CorePipelinePlugin::default());
-
-            #[cfg(feature = "bevy_sprite2")]
-            group.add(bevy_sprite2::SpritePlugin::default());
-
-            #[cfg(feature = "bevy_pbr2")]
-            group.add(bevy_pbr2::PbrPlugin::default());
-
-            #[cfg(feature = "bevy_gltf2")]
-            group.add(bevy_gltf2::GltfPlugin::default());
+            app.ignore_ambiguity(
+                bevy_app::PostUpdate,
+                bevy_animation::advance_animations,
+                bevy_ui::ui_layout_system,
+            );
+            app.ignore_ambiguity(
+                bevy_app::PostUpdate,
+                bevy_animation::animate_targets,
+                bevy_ui::ui_layout_system,
+            );
         }
     }
+}
+
+plugin_group! {
+    /// This plugin group will add the minimal plugins for a *Bevy* application:
+    pub struct MinimalPlugins {
+        bevy_app:::TaskPoolPlugin,
+        bevy_diagnostic:::FrameCountPlugin,
+        bevy_time:::TimePlugin,
+        bevy_app:::ScheduleRunnerPlugin,
+        #[cfg(feature = "bevy_ci_testing")]
+        bevy_dev_tools::ci_testing:::CiTestingPlugin,
+    }
+    /// This plugin group represents the absolute minimum, bare-bones, bevy application.
+    /// Use this if you want to have absolute control over the plugins used.
+    ///
+    /// It includes a [schedule runner (`ScheduleRunnerPlugin`)](crate::app::ScheduleRunnerPlugin)
+    /// to provide functionality that would otherwise be driven by a windowed application's
+    /// *event loop* or *message loop*.
+    ///
+    /// By default, this loop will run as fast as possible, which can result in high CPU usage.
+    /// You can add a delay using [`run_loop`](crate::app::ScheduleRunnerPlugin::run_loop),
+    /// or remove the loop using [`run_once`](crate::app::ScheduleRunnerPlugin::run_once).
+    /// # Example:
+    /// ```rust, no_run
+    /// # use std::time::Duration;
+    /// # use bevy_app::{App, PluginGroup, ScheduleRunnerPlugin};
+    /// # use bevy_internal::MinimalPlugins;
+    /// App::new().add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
+    ///     // Run 60 times per second.
+    ///     Duration::from_secs_f64(1.0 / 60.0),
+    /// ))).run();
 }

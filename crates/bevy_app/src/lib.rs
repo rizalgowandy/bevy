@@ -1,57 +1,69 @@
-//! This crate is about everything concerning the highest-level, application layer of a Bevy
-//! app.
+#![cfg_attr(
+    any(docsrs, docsrs_dep),
+    expect(
+        internal_features,
+        reason = "rustdoc_internals is needed for fake_variadic"
+    )
+)]
+#![cfg_attr(any(docsrs, docsrs_dep), feature(doc_auto_cfg, rustdoc_internals))]
+#![forbid(unsafe_code)]
+#![doc(
+    html_logo_url = "https://bevyengine.org/assets/icon.png",
+    html_favicon_url = "https://bevyengine.org/assets/icon.png"
+)]
+#![no_std]
+
+//! This crate is about everything concerning the highest-level, application layer of a Bevy app.
+
+#[cfg(feature = "std")]
+extern crate std;
+
+extern crate alloc;
+
+// Required to make proc macros work in bevy itself.
+extern crate self as bevy_app;
 
 mod app;
+mod main_schedule;
+mod panic_handler;
 mod plugin;
 mod plugin_group;
 mod schedule_runner;
-
-#[cfg(feature = "bevy_ci_testing")]
-mod ci_testing;
+mod sub_app;
+#[cfg(feature = "bevy_tasks")]
+mod task_pool_plugin;
+#[cfg(all(any(unix, windows), feature = "std"))]
+mod terminal_ctrl_c_handler;
 
 pub use app::*;
-pub use bevy_derive::DynamicPlugin;
-pub use bevy_ecs::event::*;
+pub use main_schedule::*;
+pub use panic_handler::*;
 pub use plugin::*;
 pub use plugin_group::*;
 pub use schedule_runner::*;
+pub use sub_app::*;
+#[cfg(feature = "bevy_tasks")]
+pub use task_pool_plugin::*;
+#[cfg(all(any(unix, windows), feature = "std"))]
+pub use terminal_ctrl_c_handler::*;
 
+/// The app prelude.
+///
+/// This includes the most common types in this crate, re-exported for your convenience.
 pub mod prelude {
     #[doc(hidden)]
-    pub use crate::{app::App, CoreStage, DynamicPlugin, Plugin, PluginGroup, StartupStage};
-}
+    pub use crate::{
+        app::{App, AppExit},
+        main_schedule::{
+            First, FixedFirst, FixedLast, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Last, Main,
+            PostStartup, PostUpdate, PreStartup, PreUpdate, RunFixedMainLoop,
+            RunFixedMainLoopSystem, SpawnScene, Startup, Update,
+        },
+        sub_app::SubApp,
+        Plugin, PluginGroup,
+    };
 
-use bevy_ecs::schedule::StageLabel;
-
-/// The names of the default App stages
-///
-/// The relative stages are added by [`App::add_default_stages`].
-#[derive(Debug, Hash, PartialEq, Eq, Clone, StageLabel)]
-pub enum CoreStage {
-    /// Runs only once at the beginning of the app.
-    ///
-    /// Consists of the sub-stages defined in [`StartupStage`]. Systems added here are
-    /// referred to as "startup systems".
-    Startup,
-    /// Name of app stage that runs before all other app stages
-    First,
-    /// Name of app stage responsible for performing setup before an update. Runs before UPDATE.
-    PreUpdate,
-    /// Name of app stage responsible for doing most app logic. Systems should be registered here
-    /// by default.
-    Update,
-    /// Name of app stage responsible for processing the results of UPDATE. Runs after UPDATE.
-    PostUpdate,
-    /// Name of app stage that runs after all other app stages
-    Last,
-}
-/// The names of the default App startup stages
-#[derive(Debug, Hash, PartialEq, Eq, Clone, StageLabel)]
-pub enum StartupStage {
-    /// Name of app stage that runs once before the startup stage
-    PreStartup,
-    /// Name of app stage that runs once when an app starts up
-    Startup,
-    /// Name of app stage that runs once after the startup stage
-    PostStartup,
+    #[cfg(feature = "bevy_tasks")]
+    #[doc(hidden)]
+    pub use crate::{NonSendMarker, TaskPoolOptions, TaskPoolPlugin};
 }

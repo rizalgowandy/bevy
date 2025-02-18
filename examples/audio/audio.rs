@@ -1,14 +1,17 @@
+//! This example illustrates how to load and play an audio file.
+//! For loading additional audio formats, you can enable the corresponding feature for that audio format.
+
 use bevy::prelude::*;
 
-/// This example illustrates how to load and play an audio file
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_startup_system(setup)
+        .add_systems(Startup, setup)
         .run();
 }
 
-fn setup(asset_server: Res<AssetServer>, audio: Res<Audio>) {
-    let music = asset_server.load("sounds/Windless Slopes.mp3");
-    audio.play(music);
+fn setup(asset_server: Res<AssetServer>, mut commands: Commands) {
+    commands.spawn(AudioPlayer::new(
+        asset_server.load("sounds/Windless Slopes.ogg"),
+    ));
 }

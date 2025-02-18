@@ -1,119 +1,145 @@
+//! This example illustrates how to create UI text and update it in a system.
+//!
+//! It displays the current FPS in the top left corner, as well as text that changes color
+//! in the bottom right. For text within a scene, please see the text2d example.
+
 use bevy::{
-    diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin},
+    color::palettes::css::GOLD,
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
 };
 
-/// This example illustrates how to create UI text and update it in a system. It displays the
-/// current FPS in the top left corner, as well as text that changes colour in the bottom right.
-/// For text within a scene, please see the text2d example.
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
-        .add_plugin(FrameTimeDiagnosticsPlugin::default())
-        .add_startup_system(setup)
-        .add_system(text_update_system)
-        .add_system(text_color_system)
+        .add_plugins((DefaultPlugins, FrameTimeDiagnosticsPlugin::default()))
+        .add_systems(Startup, setup)
+        .add_systems(Update, (text_update_system, text_color_system))
         .run();
 }
 
-// A unit struct to help identify the FPS UI component, since there may be many Text components
+// Marker struct to help identify the FPS UI component, since there may be many Text components
 #[derive(Component)]
 struct FpsText;
 
-// A unit struct to help identify the color-changing Text component
+// Marker struct to help identify the color-changing Text component
 #[derive(Component)]
-struct ColorText;
+struct AnimatedText;
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     // UI camera
-    commands.spawn_bundle(UiCameraBundle::default());
+    commands.spawn(Camera2d);
     // Text with one section
+    commands.spawn((
+        // Accepts a `String` or any type that converts into a `String`, such as `&str`
+        Text::new("hello\nbevy!"),
+        TextFont {
+            // This font is loaded and will be used instead of the default font.
+            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+            font_size: 67.0,
+            ..default()
+        },
+        TextShadow::default(),
+        // Set the justification of the Text
+        TextLayout::new_with_justify(JustifyText::Center),
+        // Set the style of the Node itself.
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(5.0),
+            right: Val::Px(5.0),
+            ..default()
+        },
+        AnimatedText,
+    ));
+
+    // Text with multiple sections
     commands
-        .spawn_bundle(TextBundle {
-            style: Style {
-                align_self: AlignSelf::FlexEnd,
-                position_type: PositionType::Absolute,
-                position: Rect {
-                    bottom: Val::Px(5.0),
-                    right: Val::Px(15.0),
-                    ..Default::default()
-                },
-                ..Default::default()
+        .spawn((
+            // Create a Text with multiple child spans.
+            Text::new("FPS: "),
+            TextFont {
+                // This font is loaded and will be used instead of the default font.
+                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                font_size: 42.0,
+                ..default()
             },
-            // Use the `Text::with_section` constructor
-            text: Text::with_section(
-                // Accepts a `String` or any type that converts into a `String`, such as `&str`
-                "hello\nbevy!",
-                TextStyle {
-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                    font_size: 100.0,
-                    color: Color::WHITE,
-                },
-                // Note: You can use `Default::default()` in place of the `TextAlignment`
-                TextAlignment {
-                    horizontal: HorizontalAlign::Center,
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
-        })
-        .insert(ColorText);
-    // Rich text with multiple sections
-    commands
-        .spawn_bundle(TextBundle {
-            style: Style {
-                align_self: AlignSelf::FlexEnd,
-                ..Default::default()
-            },
-            // Use `Text` directly
-            text: Text {
-                // Construct a `Vec` of `TextSection`s
-                sections: vec![
-                    TextSection {
-                        value: "FPS: ".to_string(),
-                        style: TextStyle {
-                            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                            font_size: 60.0,
-                            color: Color::WHITE,
-                        },
+        ))
+        .with_child((
+            TextSpan::default(),
+            if cfg!(feature = "default_font") {
+                (
+                    TextFont {
+                        font_size: 33.0,
+                        // If no font is specified, the default font (a minimal subset of FiraMono) will be used.
+                        ..default()
                     },
-                    TextSection {
-                        value: "".to_string(),
-                        style: TextStyle {
-                            font: asset_server.load("fonts/FiraMono-Medium.ttf"),
-                            font_size: 60.0,
-                            color: Color::GOLD,
-                        },
+                    TextColor(GOLD.into()),
+                )
+            } else {
+                (
+                    // "default_font" feature is unavailable, load a font to use instead.
+                    TextFont {
+                        font: asset_server.load("fonts/FiraMono-Medium.ttf"),
+                        font_size: 33.0,
+                        ..Default::default()
                     },
-                ],
-                ..Default::default()
+                    TextColor(GOLD.into()),
+                )
             },
-            ..Default::default()
-        })
-        .insert(FpsText);
+            FpsText,
+        ));
+
+    #[cfg(feature = "default_font")]
+    commands.spawn((
+        // Here we are able to call the `From` method instead of creating a new `TextSection`.
+        // This will use the default font (a minimal subset of FiraMono) and apply the default styling.
+        Text::new("From an &str into a Text with the default font!"),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(5.0),
+            left: Val::Px(15.0),
+            ..default()
+        },
+    ));
+
+    #[cfg(not(feature = "default_font"))]
+    commands.spawn((
+        Text::new("Default font disabled"),
+        TextFont {
+            font: asset_server.load("fonts/FiraMono-Medium.ttf"),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(5.0),
+            left: Val::Px(15.0),
+            ..default()
+        },
+    ));
 }
 
-fn text_update_system(diagnostics: Res<Diagnostics>, mut query: Query<&mut Text, With<FpsText>>) {
-    for mut text in query.iter_mut() {
-        if let Some(fps) = diagnostics.get(FrameTimeDiagnosticsPlugin::FPS) {
-            if let Some(average) = fps.average() {
-                // Update the value of the second section
-                text.sections[1].value = format!("{:.2}", average);
-            }
-        }
+fn text_color_system(time: Res<Time>, mut query: Query<&mut TextColor, With<AnimatedText>>) {
+    for mut text_color in &mut query {
+        let seconds = time.elapsed_secs();
+
+        // Update the color of the ColorText span.
+        text_color.0 = Color::srgb(
+            ops::sin(1.25 * seconds) / 2.0 + 0.5,
+            ops::sin(0.75 * seconds) / 2.0 + 0.5,
+            ops::sin(0.50 * seconds) / 2.0 + 0.5,
+        );
     }
 }
 
-fn text_color_system(time: Res<Time>, mut query: Query<&mut Text, With<ColorText>>) {
-    for mut text in query.iter_mut() {
-        let seconds = time.seconds_since_startup() as f32;
-        // We used the `Text::with_section` helper method, but it is still just a `Text`,
-        // so to update it, we are still updating the one and only section
-        text.sections[0].style.color = Color::Rgba {
-            red: (1.25 * seconds).sin() / 2.0 + 0.5,
-            green: (0.75 * seconds).sin() / 2.0 + 0.5,
-            blue: (0.50 * seconds).sin() / 2.0 + 0.5,
-            alpha: 1.0,
-        };
+fn text_update_system(
+    diagnostics: Res<DiagnosticsStore>,
+    mut query: Query<&mut TextSpan, With<FpsText>>,
+) {
+    for mut span in &mut query {
+        if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
+            if let Some(value) = fps.smoothed() {
+                // Update the value of the second section
+                **span = format!("{value:.2}");
+            }
+        }
     }
 }

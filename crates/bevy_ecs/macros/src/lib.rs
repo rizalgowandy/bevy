@@ -1,478 +1,680 @@
+#![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 extern crate proc_macro;
 
 mod component;
+mod query_data;
+mod query_filter;
+mod states;
+mod world_query;
 
-use bevy_macro_utils::{derive_label, BevyManifest};
+use crate::{query_data::derive_query_data_impl, query_filter::derive_query_filter_impl};
+use bevy_macro_utils::{derive_label, ensure_no_collision, get_struct_fields, BevyManifest};
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    parse::{Parse, ParseStream},
-    parse_macro_input,
-    punctuated::Punctuated,
-    token::Comma,
-    Data, DataStruct, DeriveInput, Field, Fields, GenericParam, Ident, Index, LitInt, Result,
-    Token,
+    parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned, token::Comma,
+    ConstParam, Data, DataStruct, DeriveInput, GenericParam, Index, TypeParam,
 };
 
-struct AllTuples {
-    macro_ident: Ident,
-    start: usize,
-    end: usize,
-    idents: Vec<Ident>,
+enum BundleFieldKind {
+    Component,
+    Ignore,
 }
 
-impl Parse for AllTuples {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let macro_ident = input.parse::<Ident>()?;
-        input.parse::<Comma>()?;
-        let start = input.parse::<LitInt>()?.base10_parse()?;
-        input.parse::<Comma>()?;
-        let end = input.parse::<LitInt>()?.base10_parse()?;
-        input.parse::<Comma>()?;
-        let mut idents = vec![input.parse::<Ident>()?];
-        while input.parse::<Comma>().is_ok() {
-            idents.push(input.parse::<Ident>()?);
-        }
-
-        Ok(AllTuples {
-            macro_ident,
-            start,
-            end,
-            idents,
-        })
-    }
-}
-
-#[proc_macro]
-pub fn all_tuples(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as AllTuples);
-    let len = (input.start..=input.end).count();
-    let mut ident_tuples = Vec::with_capacity(len);
-    for i in input.start..=input.end {
-        let idents = input
-            .idents
-            .iter()
-            .map(|ident| format_ident!("{}{}", ident, i));
-        if input.idents.len() < 2 {
-            ident_tuples.push(quote! {
-                #(#idents)*
-            });
-        } else {
-            ident_tuples.push(quote! {
-                (#(#idents),*)
-            });
-        }
-    }
-
-    let macro_ident = &input.macro_ident;
-    let invocations = (input.start..=input.end).map(|i| {
-        let ident_tuples = &ident_tuples[0..i];
-        quote! {
-            #macro_ident!(#(#ident_tuples),*);
-        }
-    });
-    TokenStream::from(quote! {
-        #(
-            #invocations
-        )*
-    })
-}
-
-static BUNDLE_ATTRIBUTE_NAME: &str = "bundle";
+const BUNDLE_ATTRIBUTE_NAME: &str = "bundle";
+const BUNDLE_ATTRIBUTE_IGNORE_NAME: &str = "ignore";
 
 #[proc_macro_derive(Bundle, attributes(bundle))]
 pub fn derive_bundle(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     let ecs_path = bevy_ecs_path();
 
-    let named_fields = match &ast.data {
-        Data::Struct(DataStruct {
-            fields: Fields::Named(fields),
-            ..
-        }) => &fields.named,
-        _ => panic!("Expected a struct with named fields."),
+    let named_fields = match get_struct_fields(&ast.data) {
+        Ok(fields) => fields,
+        Err(e) => return e.into_compile_error().into(),
     };
 
-    let is_bundle = named_fields
-        .iter()
-        .map(|field| {
-            field
-                .attrs
-                .iter()
-                .any(|a| *a.path.get_ident().as_ref().unwrap() == BUNDLE_ATTRIBUTE_NAME)
-        })
-        .collect::<Vec<bool>>();
+    let mut field_kind = Vec::with_capacity(named_fields.len());
+
+    for field in named_fields {
+        for attr in field
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident(BUNDLE_ATTRIBUTE_NAME))
+        {
+            if let Err(error) = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident(BUNDLE_ATTRIBUTE_IGNORE_NAME) {
+                    field_kind.push(BundleFieldKind::Ignore);
+                    Ok(())
+                } else {
+                    Err(meta.error(format!(
+                        "Invalid bundle attribute. Use `{BUNDLE_ATTRIBUTE_IGNORE_NAME}`"
+                    )))
+                }
+            }) {
+                return error.into_compile_error().into();
+            }
+        }
+
+        field_kind.push(BundleFieldKind::Component);
+    }
+
     let field = named_fields
         .iter()
-        .map(|field| field.ident.as_ref().unwrap())
+        .map(|field| field.ident.as_ref())
         .collect::<Vec<_>>();
+
     let field_type = named_fields
         .iter()
         .map(|field| &field.ty)
         .collect::<Vec<_>>();
 
     let mut field_component_ids = Vec::new();
+    let mut field_get_component_ids = Vec::new();
     let mut field_get_components = Vec::new();
     let mut field_from_components = Vec::new();
-    for ((field_type, is_bundle), field) in
-        field_type.iter().zip(is_bundle.iter()).zip(field.iter())
+    let mut field_required_components = Vec::new();
+    for (((i, field_type), field_kind), field) in field_type
+        .iter()
+        .enumerate()
+        .zip(field_kind.iter())
+        .zip(field.iter())
     {
-        if *is_bundle {
-            field_component_ids.push(quote! {
-                component_ids.extend(<#field_type as #ecs_path::bundle::Bundle>::component_ids(components, storages));
-            });
-            field_get_components.push(quote! {
-                self.#field.get_components(&mut func);
-            });
-            field_from_components.push(quote! {
-                #field: <#field_type as #ecs_path::bundle::Bundle>::from_components(&mut func),
-            });
-        } else {
-            field_component_ids.push(quote! {
-                component_ids.push(components.init_component::<#field_type>(storages));
-            });
-            field_get_components.push(quote! {
-                func((&mut self.#field as *mut #field_type).cast::<u8>());
-                std::mem::forget(self.#field);
-            });
-            field_from_components.push(quote! {
-                #field: func().cast::<#field_type>().read(),
-            });
+        match field_kind {
+            BundleFieldKind::Component => {
+                field_component_ids.push(quote! {
+                <#field_type as #ecs_path::bundle::Bundle>::component_ids(components, &mut *ids);
+                });
+                field_required_components.push(quote! {
+                    <#field_type as #ecs_path::bundle::Bundle>::register_required_components(components, required_components);
+                });
+                field_get_component_ids.push(quote! {
+                    <#field_type as #ecs_path::bundle::Bundle>::get_component_ids(components, &mut *ids);
+                });
+                match field {
+                    Some(field) => {
+                        field_get_components.push(quote! {
+                            self.#field.get_components(&mut *func);
+                        });
+                        field_from_components.push(quote! {
+                            #field: <#field_type as #ecs_path::bundle::BundleFromComponents>::from_components(ctx, &mut *func),
+                        });
+                    }
+                    None => {
+                        let index = Index::from(i);
+                        field_get_components.push(quote! {
+                            self.#index.get_components(&mut *func);
+                        });
+                        field_from_components.push(quote! {
+                            #index: <#field_type as #ecs_path::bundle::BundleFromComponents>::from_components(ctx, &mut *func),
+                        });
+                    }
+                }
+            }
+
+            BundleFieldKind::Ignore => {
+                field_from_components.push(quote! {
+                    #field: ::core::default::Default::default(),
+                });
+            }
         }
     }
-    let field_len = field.len();
     let generics = ast.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let struct_name = &ast.ident;
 
     TokenStream::from(quote! {
-        /// SAFE: ComponentId is returned in field-definition-order. [from_components] and [get_components] use field-definition-order
+        // SAFETY:
+        // - ComponentId is returned in field-definition-order. [get_components] uses field-definition-order
+        // - `Bundle::get_components` is exactly once for each member. Rely's on the Component -> Bundle implementation to properly pass
+        //   the correct `StorageType` into the callback.
+        #[allow(deprecated)]
         unsafe impl #impl_generics #ecs_path::bundle::Bundle for #struct_name #ty_generics #where_clause {
             fn component_ids(
                 components: &mut #ecs_path::component::Components,
-                storages: &mut #ecs_path::storage::Storages,
-            ) -> Vec<#ecs_path::component::ComponentId> {
-                let mut component_ids = Vec::with_capacity(#field_len);
+                ids: &mut impl FnMut(#ecs_path::component::ComponentId)
+            ){
                 #(#field_component_ids)*
-                component_ids
             }
 
-            #[allow(unused_variables, unused_mut, non_snake_case)]
-            unsafe fn from_components(mut func: impl FnMut() -> *mut u8) -> Self {
-                Self {
+            fn get_component_ids(
+                components: &#ecs_path::component::Components,
+                ids: &mut impl FnMut(Option<#ecs_path::component::ComponentId>)
+            ){
+                #(#field_get_component_ids)*
+            }
+
+            fn register_required_components(
+                components: &mut #ecs_path::component::Components,
+                required_components: &mut #ecs_path::component::RequiredComponents
+            ){
+                #(#field_required_components)*
+            }
+        }
+
+        // SAFETY:
+        // - ComponentId is returned in field-definition-order. [from_components] uses field-definition-order
+        #[allow(deprecated)]
+        unsafe impl #impl_generics #ecs_path::bundle::BundleFromComponents for #struct_name #ty_generics #where_clause {
+            #[allow(unused_variables, non_snake_case)]
+            unsafe fn from_components<__T, __F>(ctx: &mut __T, func: &mut __F) -> Self
+            where
+                __F: FnMut(&mut __T) -> #ecs_path::ptr::OwningPtr<'_>
+            {
+                Self{
                     #(#field_from_components)*
                 }
             }
+        }
 
-            #[allow(unused_variables, unused_mut, forget_copy, forget_ref)]
-            fn get_components(mut self, mut func: impl FnMut(*mut u8)) {
+        #[allow(deprecated)]
+        impl #impl_generics #ecs_path::bundle::DynamicBundle for #struct_name #ty_generics #where_clause {
+            type Effect = ();
+            #[allow(unused_variables)]
+            #[inline]
+            fn get_components(
+                self,
+                func: &mut impl FnMut(#ecs_path::component::StorageType, #ecs_path::ptr::OwningPtr<'_>)
+            ) {
                 #(#field_get_components)*
             }
         }
     })
 }
 
-fn get_idents(fmt_string: fn(usize) -> String, count: usize) -> Vec<Ident> {
-    (0..count)
-        .map(|i| Ident::new(&fmt_string(i), Span::call_site()))
-        .collect::<Vec<Ident>>()
-}
-
-#[proc_macro]
-pub fn impl_query_set(_input: TokenStream) -> TokenStream {
-    let mut tokens = TokenStream::new();
-    let max_queries = 4;
-    let queries = get_idents(|i| format!("Q{}", i), max_queries);
-    let filters = get_idents(|i| format!("F{}", i), max_queries);
-    let mut query_fn_muts = Vec::new();
-    for i in 0..max_queries {
-        let query = &queries[i];
-        let filter = &filters[i];
-        let fn_name = Ident::new(&format!("q{}", i), Span::call_site());
-        let index = Index::from(i);
-        query_fn_muts.push(quote! {
-            pub fn #fn_name(&mut self) -> Query<'_, '_, #query, #filter> {
-                // SAFE: systems run without conflicts with other systems.
-                // Conflicting queries in QuerySet are not accessible at the same time
-                // QuerySets are guaranteed to not conflict with other SystemParams
-                unsafe {
-                    Query::new(self.world, &self.query_states.#index, self.last_change_tick, self.change_tick)
-                }
-            }
-        });
-    }
-
-    for query_count in 1..=max_queries {
-        let query = &queries[0..query_count];
-        let filter = &filters[0..query_count];
-        let query_fn_mut = &query_fn_muts[0..query_count];
-        tokens.extend(TokenStream::from(quote! {
-            impl<'w, 's, #(#query: WorldQuery + 'static,)* #(#filter: WorldQuery + 'static,)*> SystemParam for QuerySet<'w, 's, (#(QueryState<#query, #filter>,)*)>
-                where #(#filter::Fetch: FilterFetch,)*
-            {
-                type Fetch = QuerySetState<(#(QueryState<#query, #filter>,)*)>;
-            }
-
-            // SAFE: All Queries are constrained to ReadOnlyFetch, so World is only read
-            unsafe impl<#(#query: WorldQuery + 'static,)* #(#filter: WorldQuery + 'static,)*> ReadOnlySystemParamFetch for QuerySetState<(#(QueryState<#query, #filter>,)*)>
-            where #(#query::Fetch: ReadOnlyFetch,)* #(#filter::Fetch: FilterFetch,)*
-            { }
-
-            // SAFE: Relevant query ComponentId and ArchetypeComponentId access is applied to SystemMeta. If any QueryState conflicts
-            // with any prior access, a panic will occur.
-            unsafe impl<#(#query: WorldQuery + 'static,)* #(#filter: WorldQuery + 'static,)*> SystemParamState for QuerySetState<(#(QueryState<#query, #filter>,)*)>
-                where #(#filter::Fetch: FilterFetch,)*
-            {
-                type Config = ();
-                fn init(world: &mut World, system_meta: &mut SystemMeta, config: Self::Config) -> Self {
-                    #(
-                        let mut #query = QueryState::<#query, #filter>::new(world);
-                        assert_component_access_compatibility(
-                            &system_meta.name,
-                            std::any::type_name::<#query>(),
-                            std::any::type_name::<#filter>(),
-                            &system_meta.component_access_set,
-                            &#query.component_access,
-                            world,
-                        );
-                    )*
-                    #(
-                        system_meta
-                            .component_access_set
-                            .add(#query.component_access.clone());
-                        system_meta
-                            .archetype_component_access
-                            .extend(&#query.archetype_component_access);
-                    )*
-                    QuerySetState((#(#query,)*))
-                }
-
-                fn new_archetype(&mut self, archetype: &Archetype, system_meta: &mut SystemMeta) {
-                    let (#(#query,)*) = &mut self.0;
-                    #(
-                        #query.new_archetype(archetype);
-                        system_meta
-                            .archetype_component_access
-                            .extend(&#query.archetype_component_access);
-                    )*
-                }
-
-                fn default_config() {}
-            }
-
-            impl<'w, 's, #(#query: WorldQuery + 'static,)* #(#filter: WorldQuery + 'static,)*> SystemParamFetch<'w, 's> for QuerySetState<(#(QueryState<#query, #filter>,)*)>
-                where #(#filter::Fetch: FilterFetch,)*
-            {
-                type Item = QuerySet<'w, 's, (#(QueryState<#query, #filter>,)*)>;
-
-                #[inline]
-                unsafe fn get_param(
-                    state: &'s mut Self,
-                    system_meta: &SystemMeta,
-                    world: &'w World,
-                    change_tick: u32,
-                ) -> Self::Item {
-                    QuerySet {
-                        query_states: &state.0,
-                        world,
-                        last_change_tick: system_meta.last_change_tick,
-                        change_tick,
-                    }
-                }
-            }
-
-            impl<'w, 's, #(#query: WorldQuery,)* #(#filter: WorldQuery,)*> QuerySet<'w, 's, (#(QueryState<#query, #filter>,)*)>
-                where #(#filter::Fetch: FilterFetch,)*
-            {
-                #(#query_fn_mut)*
-            }
-        }));
-    }
-
-    tokens
-}
-
-#[derive(Default)]
-struct SystemParamFieldAttributes {
-    pub ignore: bool,
-}
-
-static SYSTEM_PARAM_ATTRIBUTE_NAME: &str = "system_param";
-
-/// Implement `SystemParam` to use a struct as a parameter in a system
-#[proc_macro_derive(SystemParam, attributes(system_param))]
-pub fn derive_system_param(input: TokenStream) -> TokenStream {
+fn derive_visit_entities_base(
+    input: TokenStream,
+    trait_name: TokenStream2,
+    gen_methods: impl FnOnce(Vec<TokenStream2>) -> TokenStream2,
+) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
-    let fields = match &ast.data {
-        Data::Struct(DataStruct {
-            fields: Fields::Named(fields),
-            ..
-        }) => &fields.named,
-        _ => panic!("Expected a struct with named fields."),
+    let ecs_path = bevy_ecs_path();
+
+    let named_fields = match get_struct_fields(&ast.data) {
+        Ok(fields) => fields,
+        Err(e) => return e.into_compile_error().into(),
     };
-    let path = bevy_ecs_path();
 
-    let field_attributes = fields
+    let field = named_fields
         .iter()
-        .map(|field| {
-            (
-                field,
-                field
-                    .attrs
-                    .iter()
-                    .find(|a| *a.path.get_ident().as_ref().unwrap() == SYSTEM_PARAM_ATTRIBUTE_NAME)
-                    .map_or_else(SystemParamFieldAttributes::default, |a| {
-                        syn::custom_keyword!(ignore);
-                        let mut attributes = SystemParamFieldAttributes::default();
-                        a.parse_args_with(|input: ParseStream| {
-                            if input.parse::<Option<ignore>>()?.is_some() {
-                                attributes.ignore = true;
-                            }
-                            Ok(())
-                        })
-                        .expect("Invalid 'render_resources' attribute format.");
-
-                        attributes
-                    }),
-            )
+        .filter_map(|field| {
+            if let Some(attr) = field
+                .attrs
+                .iter()
+                .find(|a| a.path().is_ident("visit_entities"))
+            {
+                let ignore = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("ignore") {
+                        Ok(())
+                    } else {
+                        Err(meta.error("Invalid visit_entities attribute. Use `ignore`"))
+                    }
+                });
+                return match ignore {
+                    Ok(()) => None,
+                    Err(e) => Some(Err(e)),
+                };
+            }
+            Some(Ok(field))
         })
-        .collect::<Vec<(&Field, SystemParamFieldAttributes)>>();
-    let mut fields = Vec::new();
-    let mut field_indices = Vec::new();
-    let mut field_types = Vec::new();
-    let mut ignored_fields = Vec::new();
-    let mut ignored_field_types = Vec::new();
-    for (i, (field, attrs)) in field_attributes.iter().enumerate() {
-        if attrs.ignore {
-            ignored_fields.push(field.ident.as_ref().unwrap());
-            ignored_field_types.push(&field.ty);
-        } else {
-            fields.push(field.ident.as_ref().unwrap());
-            field_types.push(&field.ty);
-            field_indices.push(Index::from(i));
-        }
+        .map(|res| res.map(|field| field.ident.as_ref()))
+        .collect::<Result<Vec<_>, _>>();
+
+    let field = match field {
+        Ok(field) => field,
+        Err(e) => return e.into_compile_error().into(),
+    };
+
+    if field.is_empty() {
+        return syn::Error::new(
+            ast.span(),
+            format!("Invalid `{}` type: at least one field", trait_name),
+        )
+        .into_compile_error()
+        .into();
     }
+
+    let field_access = field
+        .iter()
+        .enumerate()
+        .map(|(n, f)| {
+            if let Some(ident) = f {
+                quote! {
+                    self.#ident
+                }
+            } else {
+                let idx = Index::from(n);
+                quote! {
+                    self.#idx
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let methods = gen_methods(field_access);
 
     let generics = ast.generics;
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    let lifetimeless_generics: Vec<_> = generics
-        .params
-        .iter()
-        .filter(|g| matches!(g, GenericParam::Type(_)))
-        .collect();
-
-    let mut punctuated_generics = Punctuated::<_, Token![,]>::new();
-    punctuated_generics.extend(lifetimeless_generics.iter());
-
-    let mut punctuated_generic_idents = Punctuated::<_, Token![,]>::new();
-    punctuated_generic_idents.extend(lifetimeless_generics.iter().map(|g| match g {
-        GenericParam::Type(g) => &g.ident,
-        _ => panic!(),
-    }));
-
+    let (impl_generics, ty_generics, _) = generics.split_for_impl();
     let struct_name = &ast.ident;
-    let fetch_struct_name = Ident::new(&format!("{}State", struct_name), Span::call_site());
-    let fetch_struct_visibility = &ast.vis;
 
     TokenStream::from(quote! {
-        impl #impl_generics #path::system::SystemParam for #struct_name #ty_generics #where_clause {
-            type Fetch = #fetch_struct_name <(#(<#field_types as #path::system::SystemParam>::Fetch,)*), #punctuated_generic_idents>;
+        impl #impl_generics #ecs_path::entity:: #trait_name for #struct_name #ty_generics {
+            #methods
         }
+    })
+}
 
-        #[doc(hidden)]
-        #fetch_struct_visibility struct #fetch_struct_name<TSystemParamState, #punctuated_generic_idents> {
-            state: TSystemParamState,
-            marker: std::marker::PhantomData<(#punctuated_generic_idents)>
-        }
-
-        unsafe impl<TSystemParamState: #path::system::SystemParamState, #punctuated_generics> #path::system::SystemParamState for #fetch_struct_name<TSystemParamState, #punctuated_generic_idents> {
-            type Config = TSystemParamState::Config;
-            fn init(world: &mut #path::world::World, system_meta: &mut #path::system::SystemMeta, config: Self::Config) -> Self {
-                Self {
-                    state: TSystemParamState::init(world, system_meta, config),
-                    marker: std::marker::PhantomData,
-                }
-            }
-
-            fn new_archetype(&mut self, archetype: &#path::archetype::Archetype, system_meta: &mut #path::system::SystemMeta) {
-                self.state.new_archetype(archetype, system_meta)
-            }
-
-            fn default_config() -> TSystemParamState::Config {
-                TSystemParamState::default_config()
-            }
-
-            fn apply(&mut self, world: &mut #path::world::World) {
-                self.state.apply(world)
-            }
-        }
-
-        impl #impl_generics #path::system::SystemParamFetch<'w, 's> for #fetch_struct_name <(#(<#field_types as #path::system::SystemParam>::Fetch,)*), #punctuated_generic_idents> {
-            type Item = #struct_name #ty_generics;
-            unsafe fn get_param(
-                state: &'s mut Self,
-                system_meta: &#path::system::SystemMeta,
-                world: &'w #path::world::World,
-                change_tick: u32,
-            ) -> Self::Item {
-                #struct_name {
-                    #(#fields: <<#field_types as #path::system::SystemParam>::Fetch as #path::system::SystemParamFetch>::get_param(&mut state.state.#field_indices, system_meta, world, change_tick),)*
-                    #(#ignored_fields: <#ignored_field_types>::default(),)*
-                }
+#[proc_macro_derive(VisitEntitiesMut, attributes(visit_entities))]
+pub fn derive_visit_entities_mut(input: TokenStream) -> TokenStream {
+    derive_visit_entities_base(input, quote! { VisitEntitiesMut }, |field| {
+        quote! {
+            fn visit_entities_mut<F: FnMut(&mut Entity)>(&mut self, mut f: F) {
+                #(#field.visit_entities_mut(&mut f);)*
             }
         }
     })
 }
 
-#[proc_macro_derive(SystemLabel)]
-pub fn derive_system_label(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let mut trait_path = bevy_ecs_path();
-    trait_path.segments.push(format_ident!("schedule").into());
-    trait_path
-        .segments
-        .push(format_ident!("SystemLabel").into());
-    derive_label(input, trait_path)
+#[proc_macro_derive(VisitEntities, attributes(visit_entities))]
+pub fn derive_visit_entities(input: TokenStream) -> TokenStream {
+    derive_visit_entities_base(input, quote! { VisitEntities }, |field| {
+        quote! {
+            fn visit_entities<F: FnMut(Entity)>(&self, mut f: F) {
+                #(#field.visit_entities(&mut f);)*
+            }
+        }
+    })
 }
 
-#[proc_macro_derive(StageLabel)]
-pub fn derive_stage_label(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let mut trait_path = bevy_ecs_path();
-    trait_path.segments.push(format_ident!("schedule").into());
-    trait_path.segments.push(format_ident!("StageLabel").into());
-    derive_label(input, trait_path)
+/// Implement `SystemParam` to use a struct as a parameter in a system
+#[proc_macro_derive(SystemParam, attributes(system_param))]
+pub fn derive_system_param(input: TokenStream) -> TokenStream {
+    let token_stream = input.clone();
+    let ast = parse_macro_input!(input as DeriveInput);
+    let Data::Struct(DataStruct {
+        fields: field_definitions,
+        ..
+    }) = ast.data
+    else {
+        return syn::Error::new(
+            ast.span(),
+            "Invalid `SystemParam` type: expected a `struct`",
+        )
+        .into_compile_error()
+        .into();
+    };
+    let path = bevy_ecs_path();
+
+    let mut field_locals = Vec::new();
+    let mut fields = Vec::new();
+    let mut field_types = Vec::new();
+    for (i, field) in field_definitions.iter().enumerate() {
+        field_locals.push(format_ident!("f{i}"));
+        let i = Index::from(i);
+        fields.push(
+            field
+                .ident
+                .as_ref()
+                .map(|f| quote! { #f })
+                .unwrap_or_else(|| quote! { #i }),
+        );
+        field_types.push(&field.ty);
+    }
+
+    let generics = ast.generics;
+
+    // Emit an error if there's any unrecognized lifetime names.
+    for lt in generics.lifetimes() {
+        let ident = &lt.lifetime.ident;
+        let w = format_ident!("w");
+        let s = format_ident!("s");
+        if ident != &w && ident != &s {
+            return syn::Error::new_spanned(
+                lt,
+                r#"invalid lifetime name: expected `'w` or `'s`
+ 'w -- refers to data stored in the World.
+ 's -- refers to data stored in the SystemParam's state.'"#,
+            )
+            .into_compile_error()
+            .into();
+        }
+    }
+
+    let (_impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let lifetimeless_generics: Vec<_> = generics
+        .params
+        .iter()
+        .filter(|g| !matches!(g, GenericParam::Lifetime(_)))
+        .collect();
+
+    let shadowed_lifetimes: Vec<_> = generics.lifetimes().map(|_| quote!('_)).collect();
+
+    let mut punctuated_generics = Punctuated::<_, Comma>::new();
+    punctuated_generics.extend(lifetimeless_generics.iter().map(|g| match g {
+        GenericParam::Type(g) => GenericParam::Type(TypeParam {
+            default: None,
+            ..g.clone()
+        }),
+        GenericParam::Const(g) => GenericParam::Const(ConstParam {
+            default: None,
+            ..g.clone()
+        }),
+        _ => unreachable!(),
+    }));
+
+    let mut punctuated_generic_idents = Punctuated::<_, Comma>::new();
+    punctuated_generic_idents.extend(lifetimeless_generics.iter().map(|g| match g {
+        GenericParam::Type(g) => &g.ident,
+        GenericParam::Const(g) => &g.ident,
+        _ => unreachable!(),
+    }));
+
+    let punctuated_generics_no_bounds: Punctuated<_, Comma> = lifetimeless_generics
+        .iter()
+        .map(|&g| match g.clone() {
+            GenericParam::Type(mut g) => {
+                g.bounds.clear();
+                GenericParam::Type(g)
+            }
+            g => g,
+        })
+        .collect();
+
+    let mut tuple_types: Vec<_> = field_types.iter().map(|x| quote! { #x }).collect();
+    let mut tuple_patterns: Vec<_> = field_locals.iter().map(|x| quote! { #x }).collect();
+
+    // If the number of fields exceeds the 16-parameter limit,
+    // fold the fields into tuples of tuples until we are below the limit.
+    const LIMIT: usize = 16;
+    while tuple_types.len() > LIMIT {
+        let end = Vec::from_iter(tuple_types.drain(..LIMIT));
+        tuple_types.push(parse_quote!( (#(#end,)*) ));
+
+        let end = Vec::from_iter(tuple_patterns.drain(..LIMIT));
+        tuple_patterns.push(parse_quote!( (#(#end,)*) ));
+    }
+
+    // Create a where clause for the `ReadOnlySystemParam` impl.
+    // Ensure that each field implements `ReadOnlySystemParam`.
+    let mut read_only_generics = generics.clone();
+    let read_only_where_clause = read_only_generics.make_where_clause();
+    for field_type in &field_types {
+        read_only_where_clause
+            .predicates
+            .push(syn::parse_quote!(#field_type: #path::system::ReadOnlySystemParam));
+    }
+
+    let fields_alias =
+        ensure_no_collision(format_ident!("__StructFieldsAlias"), token_stream.clone());
+
+    let struct_name = &ast.ident;
+    let state_struct_visibility = &ast.vis;
+    let state_struct_name = ensure_no_collision(format_ident!("FetchState"), token_stream);
+
+    let mut builder_name = None;
+    for meta in ast
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("system_param"))
+    {
+        if let Err(e) = meta.parse_nested_meta(|nested| {
+            if nested.path.is_ident("builder") {
+                builder_name = Some(format_ident!("{struct_name}Builder"));
+                Ok(())
+            } else {
+                Err(nested.error("Unsupported attribute"))
+            }
+        }) {
+            return e.into_compile_error().into();
+        }
+    }
+
+    let builder = builder_name.map(|builder_name| {
+        let builder_type_parameters: Vec<_> = (0..fields.len()).map(|i| format_ident!("B{i}")).collect();
+        let builder_doc_comment = format!("A [`SystemParamBuilder`] for a [`{struct_name}`].");
+        let builder_struct = quote! {
+            #[doc = #builder_doc_comment]
+            struct #builder_name<#(#builder_type_parameters,)*> {
+                #(#fields: #builder_type_parameters,)*
+            }
+        };
+        let lifetimes: Vec<_> = generics.lifetimes().collect();
+        let generic_struct = quote!{ #struct_name <#(#lifetimes,)* #punctuated_generic_idents> };
+        let builder_impl = quote!{
+            // SAFETY: This delegates to the `SystemParamBuilder` for tuples.
+            unsafe impl<
+                #(#lifetimes,)*
+                #(#builder_type_parameters: #path::system::SystemParamBuilder<#field_types>,)*
+                #punctuated_generics
+            > #path::system::SystemParamBuilder<#generic_struct> for #builder_name<#(#builder_type_parameters,)*>
+                #where_clause
+            {
+                fn build(self, world: &mut #path::world::World, meta: &mut #path::system::SystemMeta) -> <#generic_struct as #path::system::SystemParam>::State {
+                    let #builder_name { #(#fields: #field_locals,)* } = self;
+                    #state_struct_name {
+                        state: #path::system::SystemParamBuilder::build((#(#tuple_patterns,)*), world, meta)
+                    }
+                }
+            }
+        };
+        (builder_struct, builder_impl)
+    });
+    let (builder_struct, builder_impl) = builder.unzip();
+
+    TokenStream::from(quote! {
+        // We define the FetchState struct in an anonymous scope to avoid polluting the user namespace.
+        // The struct can still be accessed via SystemParam::State, e.g. EventReaderState can be accessed via
+        // <EventReader<'static, 'static, T> as SystemParam>::State
+        const _: () = {
+            // Allows rebinding the lifetimes of each field type.
+            type #fields_alias <'w, 's, #punctuated_generics_no_bounds> = (#(#tuple_types,)*);
+
+            #[doc(hidden)]
+            #state_struct_visibility struct #state_struct_name <#(#lifetimeless_generics,)*>
+            #where_clause {
+                state: <#fields_alias::<'static, 'static, #punctuated_generic_idents> as #path::system::SystemParam>::State,
+            }
+
+            unsafe impl<#punctuated_generics> #path::system::SystemParam for
+                #struct_name <#(#shadowed_lifetimes,)* #punctuated_generic_idents> #where_clause
+            {
+                type State = #state_struct_name<#punctuated_generic_idents>;
+                type Item<'w, 's> = #struct_name #ty_generics;
+
+                fn init_state(world: &mut #path::world::World, system_meta: &mut #path::system::SystemMeta) -> Self::State {
+                    #state_struct_name {
+                        state: <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::init_state(world, system_meta),
+                    }
+                }
+
+                unsafe fn new_archetype(state: &mut Self::State, archetype: &#path::archetype::Archetype, system_meta: &mut #path::system::SystemMeta) {
+                    // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
+                    unsafe { <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::new_archetype(&mut state.state, archetype, system_meta) }
+                }
+
+                fn apply(state: &mut Self::State, system_meta: &#path::system::SystemMeta, world: &mut #path::world::World) {
+                    <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::apply(&mut state.state, system_meta, world);
+                }
+
+                fn queue(state: &mut Self::State, system_meta: &#path::system::SystemMeta, world: #path::world::DeferredWorld) {
+                    <#fields_alias::<'_, '_, #punctuated_generic_idents> as #path::system::SystemParam>::queue(&mut state.state, system_meta, world);
+                }
+
+                #[inline]
+                unsafe fn validate_param<'w, 's>(
+                    state: &'s Self::State,
+                    system_meta: &#path::system::SystemMeta,
+                    world: #path::world::unsafe_world_cell::UnsafeWorldCell<'w>,
+                ) -> bool {
+                    <(#(#tuple_types,)*) as #path::system::SystemParam>::validate_param(&state.state, system_meta, world)
+                }
+
+                #[inline]
+                unsafe fn get_param<'w, 's>(
+                    state: &'s mut Self::State,
+                    system_meta: &#path::system::SystemMeta,
+                    world: #path::world::unsafe_world_cell::UnsafeWorldCell<'w>,
+                    change_tick: #path::component::Tick,
+                ) -> Self::Item<'w, 's> {
+                    let (#(#tuple_patterns,)*) = <
+                        (#(#tuple_types,)*) as #path::system::SystemParam
+                    >::get_param(&mut state.state, system_meta, world, change_tick);
+                    #struct_name {
+                        #(#fields: #field_locals,)*
+                    }
+                }
+            }
+
+            // Safety: Each field is `ReadOnlySystemParam`, so this can only read from the `World`
+            unsafe impl<'w, 's, #punctuated_generics> #path::system::ReadOnlySystemParam for #struct_name #ty_generics #read_only_where_clause {}
+
+            #builder_impl
+        };
+
+        #builder_struct
+    })
 }
 
-#[proc_macro_derive(AmbiguitySetLabel)]
-pub fn derive_ambiguity_set_label(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let mut trait_path = bevy_ecs_path();
-    trait_path.segments.push(format_ident!("schedule").into());
-    trait_path
-        .segments
-        .push(format_ident!("AmbiguitySetLabel").into());
-    derive_label(input, trait_path)
+/// Implement `QueryData` to use a struct as a data parameter in a query
+#[proc_macro_derive(QueryData, attributes(query_data))]
+pub fn derive_query_data(input: TokenStream) -> TokenStream {
+    derive_query_data_impl(input)
 }
 
-#[proc_macro_derive(RunCriteriaLabel)]
-pub fn derive_run_criteria_label(input: TokenStream) -> TokenStream {
+/// Implement `QueryFilter` to use a struct as a filter parameter in a query
+#[proc_macro_derive(QueryFilter, attributes(query_filter))]
+pub fn derive_query_filter(input: TokenStream) -> TokenStream {
+    derive_query_filter_impl(input)
+}
+
+/// Derive macro generating an impl of the trait `ScheduleLabel`.
+///
+/// This does not work for unions.
+#[proc_macro_derive(ScheduleLabel)]
+pub fn derive_schedule_label(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let mut trait_path = bevy_ecs_path();
     trait_path.segments.push(format_ident!("schedule").into());
+    let mut dyn_eq_path = trait_path.clone();
     trait_path
         .segments
-        .push(format_ident!("RunCriteriaLabel").into());
-    derive_label(input, trait_path)
+        .push(format_ident!("ScheduleLabel").into());
+    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+    derive_label(input, "ScheduleLabel", &trait_path, &dyn_eq_path)
+}
+
+/// Derive macro generating an impl of the trait `SystemSet`.
+///
+/// This does not work for unions.
+#[proc_macro_derive(SystemSet)]
+pub fn derive_system_set(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let mut trait_path = bevy_ecs_path();
+    trait_path.segments.push(format_ident!("schedule").into());
+    let mut dyn_eq_path = trait_path.clone();
+    trait_path.segments.push(format_ident!("SystemSet").into());
+    dyn_eq_path.segments.push(format_ident!("DynEq").into());
+    derive_label(input, "SystemSet", &trait_path, &dyn_eq_path)
 }
 
 pub(crate) fn bevy_ecs_path() -> syn::Path {
-    BevyManifest::default().get_path("bevy_ecs")
+    BevyManifest::shared().get_path("bevy_ecs")
 }
 
-#[proc_macro_derive(Component, attributes(component))]
+#[proc_macro_derive(Event)]
+pub fn derive_event(input: TokenStream) -> TokenStream {
+    component::derive_event(input)
+}
+
+#[proc_macro_derive(Resource)]
+pub fn derive_resource(input: TokenStream) -> TokenStream {
+    component::derive_resource(input)
+}
+
+#[proc_macro_derive(
+    Component,
+    attributes(component, relationship, relationship_target, entities)
+)]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     component::derive_component(input)
+}
+
+/// Allows specifying a component's required components.
+///
+/// See `Component` docs for usage.
+#[proc_macro_attribute]
+pub fn require(attr: TokenStream, item: TokenStream) -> TokenStream {
+    component::document_required_components(attr, item)
+}
+
+#[proc_macro_derive(States)]
+pub fn derive_states(input: TokenStream) -> TokenStream {
+    states::derive_states(input)
+}
+
+#[proc_macro_derive(SubStates, attributes(source))]
+pub fn derive_substates(input: TokenStream) -> TokenStream {
+    states::derive_substates(input)
+}
+
+#[proc_macro_derive(FromWorld, attributes(from_world))]
+pub fn derive_from_world(input: TokenStream) -> TokenStream {
+    let bevy_ecs_path = bevy_ecs_path();
+    let ast = parse_macro_input!(input as DeriveInput);
+    let name = ast.ident;
+    let (impl_generics, ty_generics, where_clauses) = ast.generics.split_for_impl();
+
+    let (fields, variant_ident) = match &ast.data {
+        Data::Struct(data) => (&data.fields, None),
+        Data::Enum(data) => {
+            match data.variants.iter().find(|variant| {
+                variant
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.path().is_ident("from_world"))
+            }) {
+                Some(variant) => (&variant.fields, Some(&variant.ident)),
+                None => {
+                    return syn::Error::new(
+                        Span::call_site(),
+                        "No variant found with the `#[from_world]` attribute",
+                    )
+                    .into_compile_error()
+                    .into();
+                }
+            }
+        }
+        Data::Union(_) => {
+            return syn::Error::new(
+                Span::call_site(),
+                "#[derive(FromWorld)]` does not support unions",
+            )
+            .into_compile_error()
+            .into();
+        }
+    };
+
+    let field_init_expr = quote!(#bevy_ecs_path::world::FromWorld::from_world(world));
+    let members = fields.members();
+
+    let field_initializers = match variant_ident {
+        Some(variant_ident) => quote!( Self::#variant_ident {
+            #(#members: #field_init_expr),*
+        }),
+        None => quote!( Self {
+            #(#members: #field_init_expr),*
+        }),
+    };
+
+    TokenStream::from(quote! {
+            impl #impl_generics #bevy_ecs_path::world::FromWorld for #name #ty_generics #where_clauses {
+                fn from_world(world: &mut #bevy_ecs_path::world::World) -> Self {
+                    #field_initializers
+                }
+            }
+    })
 }

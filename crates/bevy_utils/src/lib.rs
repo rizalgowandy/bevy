@@ -1,209 +1,189 @@
-mod enum_variant_meta;
-pub mod label;
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![doc(
+    html_logo_url = "https://bevyengine.org/assets/icon.png",
+    html_favicon_url = "https://bevyengine.org/assets/icon.png"
+)]
+#![no_std]
 
-pub use ahash::AHasher;
-pub use enum_variant_meta::*;
-pub use instant::{Duration, Instant};
-pub use tracing;
-pub use uuid::Uuid;
+//! General utilities for first-party [Bevy] engine crates.
+//!
+//! [Bevy]: https://bevyengine.org/
 
-use ahash::RandomState;
-use std::{future::Future, pin::Pin};
+#[cfg(feature = "std")]
+extern crate std;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
-#[cfg(target_arch = "wasm32")]
-pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+/// The utilities prelude.
+///
+/// This includes the most common types in this crate, re-exported for your convenience.
+pub mod prelude {
+    pub use crate::default;
+}
 
-/// A hasher builder that will create a fixed hasher.
-#[derive(Debug, Clone, Default)]
-pub struct FixedState;
+pub mod synccell;
+pub mod syncunsafecell;
 
-impl std::hash::BuildHasher for FixedState {
-    type Hasher = AHasher;
+mod default;
+mod once;
+#[cfg(feature = "std")]
+mod parallel_queue;
 
+#[doc(hidden)]
+pub use once::OnceFlag;
+
+pub use default::default;
+
+#[cfg(feature = "std")]
+pub use parallel_queue::*;
+
+use core::mem::ManuallyDrop;
+
+#[cfg(feature = "alloc")]
+use {
+    bevy_platform_support::{
+        collections::HashMap,
+        hash::{Hashed, NoOpHash, PassHash},
+    },
+    core::{any::TypeId, hash::Hash},
+};
+
+/// A [`HashMap`] pre-configured to use [`Hashed`] keys and [`PassHash`] passthrough hashing.
+/// Iteration order only depends on the order of insertions and deletions.
+#[cfg(feature = "alloc")]
+pub type PreHashMap<K, V> = HashMap<Hashed<K>, V, PassHash>;
+
+/// Extension methods intended to add functionality to [`PreHashMap`].
+#[cfg(feature = "alloc")]
+pub trait PreHashMapExt<K, V> {
+    /// Tries to get or insert the value for the given `key` using the pre-computed hash first.
+    /// If the [`PreHashMap`] does not already contain the `key`, it will clone it and insert
+    /// the value returned by `func`.
+    fn get_or_insert_with<F: FnOnce() -> V>(&mut self, key: &Hashed<K>, func: F) -> &mut V;
+}
+
+#[cfg(feature = "alloc")]
+impl<K: Hash + Eq + PartialEq + Clone, V> PreHashMapExt<K, V> for PreHashMap<K, V> {
     #[inline]
-    fn build_hasher(&self) -> AHasher {
-        AHasher::new_with_keys(
-            0b1001010111101110000001001100010000000011001001101011001001111000,
-            0b1100111101101011011110001011010100000100001111100011010011010101,
-        )
+    fn get_or_insert_with<F: FnOnce() -> V>(&mut self, key: &Hashed<K>, func: F) -> &mut V {
+        use bevy_platform_support::collections::hash_map::RawEntryMut;
+        let entry = self
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(key.hash(), key);
+        match entry {
+            RawEntryMut::Occupied(entry) => entry.into_mut(),
+            RawEntryMut::Vacant(entry) => {
+                let (_, value) = entry.insert_hashed_nocheck(key.hash(), key.clone(), func());
+                value
+            }
+        }
     }
 }
 
-/// A [`HashMap`][std::collections::HashMap] implementing [aHash][aHash], a high
-/// speed keyed hashing algorithm intended for use in in-memory hashmaps.
-///
-/// AHash is designed for performance and is NOT cryptographically secure.
-///
-/// # Construction
-///
-/// Users may be surprised when a `HashMap` cannot be constructed with `HashMap::new()`:
-///
-/// ```compile_fail
-/// # fn main() {
-/// use bevy_utils::HashMap;
-///
-/// // Produces an error like "no function or associated item named `new` found [...]"
-/// let map: HashMap<String, String> = HashMap::new();
-/// # }
-/// ```
-///
-/// The standard library's [`HashMap::new`][std::collections::HashMap::new] is
-/// implemented only for `HashMap`s which use the
-/// [`DefaultHasher`][std::collections::hash_map::DefaultHasher], so it's not
-/// available for Bevy's `HashMap`.
-///
-/// However, an empty `HashMap` can easily be constructed using the `Default`
-/// implementation:
-///
-/// ```
-/// # fn main() {
-/// use bevy_utils::HashMap;
-///
-/// // This works!
-/// let map: HashMap<String, String> = HashMap::default();
-/// assert!(map.is_empty());
-/// # }
-/// ```
-///
-/// [aHash]: https://github.com/tkaitchuck/aHash
-pub type HashMap<K, V> = std::collections::HashMap<K, V, RandomState>;
+/// A specialized hashmap type with Key of [`TypeId`]
+/// Iteration order only depends on the order of insertions and deletions.
+#[cfg(feature = "alloc")]
+pub type TypeIdMap<V> = HashMap<TypeId, V, NoOpHash>;
 
-pub trait AHashExt {
-    fn with_capacity(capacity: usize) -> Self;
+/// A type which calls a function when dropped.
+/// This can be used to ensure that cleanup code is run even in case of a panic.
+///
+/// Note that this only works for panics that [unwind](https://doc.rust-lang.org/nomicon/unwinding.html)
+/// -- any code within `OnDrop` will be skipped if a panic does not unwind.
+/// In most cases, this will just work.
+///
+/// # Examples
+///
+/// ```
+/// # use bevy_utils::OnDrop;
+/// # fn test_panic(do_panic: bool, log: impl FnOnce(&str)) {
+/// // This will print a message when the variable `_catch` gets dropped,
+/// // even if a panic occurs before we reach the end of this scope.
+/// // This is similar to a `try ... catch` block in languages such as C++.
+/// let _catch = OnDrop::new(|| log("Oops, a panic occurred and this function didn't complete!"));
+///
+/// // Some code that may panic...
+/// // ...
+/// # if do_panic { panic!() }
+///
+/// // Make sure the message only gets printed if a panic occurs.
+/// // If we remove this line, then the message will be printed regardless of whether a panic occurs
+/// // -- similar to a `try ... finally` block.
+/// core::mem::forget(_catch);
+/// # }
+/// #
+/// # test_panic(false, |_| unreachable!());
+/// # let mut did_log = false;
+/// # std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+/// #   test_panic(true, |_| did_log = true);
+/// # }));
+/// # assert!(did_log);
+/// ```
+pub struct OnDrop<F: FnOnce()> {
+    callback: ManuallyDrop<F>,
 }
 
-impl<K, V> AHashExt for HashMap<K, V> {
-    /// Creates an empty `HashMap` with the specified capacity with AHash.
-    ///
-    /// The hash map will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash map will not allocate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bevy_utils::{HashMap, AHashExt};
-    /// let mut map: HashMap<&str, i32> = HashMap::with_capacity(10);
-    /// assert!(map.capacity() >= 10);
-    /// ```
-    #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        HashMap::with_capacity_and_hasher(capacity, RandomState::default())
+impl<F: FnOnce()> OnDrop<F> {
+    /// Returns an object that will invoke the specified callback when dropped.
+    pub fn new(callback: F) -> Self {
+        Self {
+            callback: ManuallyDrop::new(callback),
+        }
     }
 }
 
-/// A stable std hash map implementing AHash, a high speed keyed hashing algorithm
-/// intended for use in in-memory hashmaps.
-///
-/// Unlike [`HashMap`] this has an iteration order that only depends on the order
-/// of insertions and deletions and not a random source.
-///
-/// AHash is designed for performance and is NOT cryptographically secure.
-pub type StableHashMap<K, V> = std::collections::HashMap<K, V, FixedState>;
-
-impl<K, V> AHashExt for StableHashMap<K, V> {
-    /// Creates an empty `StableHashMap` with the specified capacity with AHash.
-    ///
-    /// The hash map will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash map will not allocate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bevy_utils::{StableHashMap, AHashExt};
-    /// let mut map: StableHashMap<&str, i32> = StableHashMap::with_capacity(10);
-    /// assert!(map.capacity() >= 10);
-    /// ```
-    #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        StableHashMap::with_capacity_and_hasher(capacity, FixedState::default())
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        #![expect(
+            unsafe_code,
+            reason = "Taking from a ManuallyDrop requires unsafe code."
+        )]
+        // SAFETY: We may move out of `self`, since this instance can never be observed after it's dropped.
+        let callback = unsafe { ManuallyDrop::take(&mut self.callback) };
+        callback();
     }
 }
 
-/// A [`HashSet`][std::collections::HashSet] implementing [aHash][aHash], a high
-/// speed keyed hashing algorithm intended for use in in-memory hashmaps.
-///
-/// AHash is designed for performance and is NOT cryptographically secure.
-///
-/// # Construction
-///
-/// Users may be surprised when a `HashSet` cannot be constructed with `HashSet::new()`:
-///
-/// ```compile_fail
-/// # fn main() {
-/// use bevy_utils::HashSet;
-///
-/// // Produces an error like "no function or associated item named `new` found [...]"
-/// let map: HashSet<String> = HashSet::new();
-/// # }
-/// ```
-///
-/// The standard library's [`HashSet::new`][std::collections::HashSet::new] is
-/// implemented only for `HashSet`s which use the
-/// [`DefaultHasher`][std::collections::hash_map::DefaultHasher], so it's not
-/// available for Bevy's `HashSet`.
-///
-/// However, an empty `HashSet` can easily be constructed using the `Default`
-/// implementation:
-///
-/// ```
-/// # fn main() {
-/// use bevy_utils::HashSet;
-///
-/// // This works!
-/// let map: HashSet<String> = HashSet::default();
-/// assert!(map.is_empty());
-/// # }
-/// ```
-///
-/// [aHash]: https://github.com/tkaitchuck/aHash
-pub type HashSet<K> = std::collections::HashSet<K, RandomState>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_impl_all;
 
-impl<K> AHashExt for HashSet<K> {
-    /// Creates an empty `HashSet` with the specified capacity with AHash.
-    ///
-    /// The hash set will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash set will not allocate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bevy_utils::{HashSet, AHashExt};
-    /// let set: HashSet<i32> = HashSet::with_capacity(10);
-    /// assert!(set.capacity() >= 10);
-    /// ```
-    #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        HashSet::with_capacity_and_hasher(capacity, RandomState::default())
+    // Check that the HashMaps are Clone if the key/values are Clone
+    assert_impl_all!(PreHashMap::<u64, usize>: Clone);
+
+    #[test]
+    fn fast_typeid_hash() {
+        struct Hasher;
+
+        impl core::hash::Hasher for Hasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {
+                panic!("Hashing of core::any::TypeId changed");
+            }
+            fn write_u64(&mut self, _: u64) {}
+        }
+
+        Hash::hash(&TypeId::of::<()>(), &mut Hasher);
     }
-}
 
-/// A stable std hash set implementing AHash, a high speed keyed hashing algorithm
-/// intended for use in in-memory hashmaps.
-///
-/// Unlike [`HashSet`] this has an iteration order that only depends on the order
-/// of insertions and deletions and not a random source.
-///
-/// AHash is designed for performance and is NOT cryptographically secure.
-pub type StableHashSet<K> = std::collections::HashSet<K, FixedState>;
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn stable_hash_within_same_program_execution() {
+        use alloc::vec::Vec;
 
-impl<K> AHashExt for StableHashSet<K> {
-    /// Creates an empty `StableHashSet` with the specified capacity with AHash.
-    ///
-    /// The hash set will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash set will not allocate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bevy_utils::{StableHashSet, AHashExt};
-    /// let set: StableHashSet<i32> = StableHashSet::with_capacity(10);
-    /// assert!(set.capacity() >= 10);
-    /// ```
-    #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        StableHashSet::with_capacity_and_hasher(capacity, FixedState::default())
+        let mut map_1 = <HashMap<_, _>>::default();
+        let mut map_2 = <HashMap<_, _>>::default();
+        for i in 1..10 {
+            map_1.insert(i, i);
+            map_2.insert(i, i);
+        }
+        assert_eq!(
+            map_1.iter().collect::<Vec<_>>(),
+            map_2.iter().collect::<Vec<_>>()
+        );
     }
 }

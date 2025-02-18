@@ -1,20 +1,22 @@
+//! This example creates a custom [`SystemParam`] struct that counts the number of players.
+
 use bevy::{ecs::system::SystemParam, prelude::*};
 
-/// This example creates a SystemParam struct that counts the number of players
 fn main() {
     App::new()
         .insert_resource(PlayerCount(0))
-        .add_startup_system(spawn)
-        .add_system(count_players)
+        .add_systems(Startup, spawn)
+        .add_systems(Update, count_players)
         .run();
 }
 
 #[derive(Component)]
-pub struct Player;
-#[derive(Component)]
-pub struct PlayerCount(usize);
+struct Player;
 
-/// The SystemParam struct can contain any types that can also be included in a
+#[derive(Resource)]
+struct PlayerCount(usize);
+
+/// The [`SystemParam`] struct can contain any types that can also be included in a
 /// system function signature.
 ///
 /// In this example, it includes a query and a mutable resource.
@@ -32,12 +34,12 @@ impl<'w, 's> PlayerCounter<'w, 's> {
 
 /// Spawn some players to count
 fn spawn(mut commands: Commands) {
-    commands.spawn().insert(Player);
-    commands.spawn().insert(Player);
-    commands.spawn().insert(Player);
+    commands.spawn(Player);
+    commands.spawn(Player);
+    commands.spawn(Player);
 }
 
-/// The SystemParam can be used directly in a system argument.
+/// The [`SystemParam`] can be used directly in a system argument.
 fn count_players(mut counter: PlayerCounter) {
     counter.count();
 
